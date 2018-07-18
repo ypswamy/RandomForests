@@ -1,0 +1,212 @@
+﻿install.packages("plyr")
+install.packages("tidyverse")
+install.packages("caret")
+install.packages("GGally")
+install.packages("stringr")
+install.packages("rattle")
+install.packages("pROC")
+install.packages("ROCR")
+
+library(plyr)
+library(tidyverse)
+library(caret)
+library(GGally)
+library(stringr)
+library(rattle)
+library(pROC)
+library(ROCR)
+
+setwd("C:/Users/Pandu/Desktop/Pandu_ course/CASE_STUDY/Hack/HACK1")
+fraud_raw <- read_csv("cust_trans_data_01.csv")
+
+dim(fraud_raw)
+names(fraud_raw)
+summary(fraud_raw)
+str(fraud_raw)
+
+The nameOrig and nameDest variables are technically categorical but there are too many to be useful for modelling. I noticed that the names have a letter-prefix which may be important.
+
+step 1 - simplify nameorg and namedes columns - mutate``
+
+fraud_df <- fraud_raw %>%
+    mutate(name_orig_first = str_sub(nameOrig,1,1)) %>%
+    mutate(name_dest_first = str_sub(nameDest, 1, 1))
+	
+unique(fraud_df$name_orig_first)
+unique(fraud_df$name_dest_first)
+
+step 2 - convert name_dest_first to factor 
+
+fraud_df$name_dest_first <- as.factor(fraud_df$name_dest_first)
+table(fraud_df$name_dest_first)
+
+step 3 - Remove org_first and isflagged true and include all to new df
+
+str(fraud_df)
+fraud_df2 <- fraud_df %>%
+    select(-name_orig_first, -isFlaggedFraud) %>%
+    select(isFraud, type, step, everything())
+str(fraud_df2)
+
+step 4 - convert type and isfraud to factor
+
+fraud_df2$type <- as.factor(fraud_df2$type)
+fraud_df2$isFraud <- as.factor(fraud_df2$isFraud)
+
+Some models we’ll use do not like 1’s and 0’s in the result, so we will recode them.
+
+STEP 5 - Recode 0 to NO and 1 to YES
+
+summary(fraud_df2$isFraud)
+fraud_df2$isFraud <- recode_factor(fraud_df2$isFraud, `0` = "No", `1` = "Yes")
+summary(fraud_df2$isFraud)
+
+summary(fraud_df2)
+str(fraud_df2)
+
+Step 6 - copy isfraud = yes in new data frame
+
+fraud_trans <- fraud_df2 %>%
+    filter(isFraud == "Yes") 
+	
+summary(fraud_trans)
+
+step 7 - filer type,amount,dest_first and remove namedest to newdf
+
+fraud_df3 <- fraud_df2 %>%
+    filter(type %in% c("CASH_OUT", "TRANSFER")) %>%
+    filter(name_dest_first == "C") %>%
+    filter(amount <= 10000000) %>%
+    select(-name_dest_first)
+	
+fraud_df3 <- fraud_df3[,-c(5,8)]
+	
+summary(fraud_df3)
+
+STEP 8 - Create sample data setwd
+
+not_fraud <- fraud_df3 %>%
+    filter(isFraud == "No") %>%
+    sample_n(1161)
+
+is_fraud <- fraud_df3 %>%
+    filter(isFraud == "Yes")
+
+full_sample <- rbind(not_fraud, is_fraud) %>%
+    arrange(step)
+
+Step 9 - check for correlation
+	
+ggpairs(full_sample)
+
+#There is a high positive correlation between OldBalanceOrig and newBalanceOrig.
+#Also a high correlation between oldBalanceDest and newBalanceDest
+
+summary(full_sample)
+
+Step 10 - Preprocess the data
+
+#Pre-processing the full dataset for modelling
+preproc_model <- preProcess(fraud_df3[, -1], 
+                            method = c("center", "scale", "nzv"))
+							
+fraud_preproc <- predict(preproc_model, newdata = fraud_df3[,-1])							
+							
+#Bind the results to the pre-processed data
+fraud_pp_w_result <- cbind(isFraud = fraud_df3$isFraud, fraud_preproc)
+
+summary(fraud_pp_w_result)
+
+#Remove result column and categorical columns (don’t worry we’ll put them back #after this test)
+
+fraud_numeric <- fraud_pp_w_result %>%
+    select(-isFraud, -type)
+
+#Find any highly correlated predictors and remove	
+high_cor_cols <- findCorrelation(cor(fraud_numeric), cutoff = .75, verbose = TRUE, 
+                                 names = TRUE, exact = TRUE)
+
+#Remove high correlation columns
+high_cor_removed <- fraud_pp_w_result %>%
+    select(-newbalanceDest)
+
+#Copy final data to a more general dataframe
+model_df <-high_cor_removed
+
+#Create equal amount of Fraud and Not Fraud data for training
+is_fraud <- model_df %>%
+    filter(isFraud == "Yes")
+
+not_fraud <- model_df %>%
+    filter(isFraud == "No") %>%
+    sample_n(1161)
+
+# To mix up the sample set I'll arrange by `step`
+model_full_sample <- rbind(is_fraud, not_fraud) %>%
+    arrange(step)
+	
+#Split sample into train and test sets
+in_train <- createDataPartition(y = model_full_sample$isFraud, p = .75, 
+                               list = FALSE) 
+train <- model_full_sample[in_train, ] 
+test <- model_full_sample[-in_train, ] 
+
+#Create control used to fit all models
+#We will use three iterations of 10-fold cross-validation for every model so that #we can compare apples-to-apples.
+
+control <- trainControl(method = "repeatedcv", 
+                        number = 10, 
+                        repeats = 3, 
+                        classProbs = TRUE, 
+                        summaryFunction = twoClassSummary)
+						
+#Establish Big No-Fraud dataset
+big_no_sample <- model_df %>%
+    filter(isFraud == "No") %>%
+    sample_n(100000)
+
+grid <- expand.grid(.mtry = 5, .ntree = seq(25, 150, by = 25))
+
+start_time <- Sys.time()
+rf_model <- train(isFraud ~ ., 
+                  data = train, 
+                  method="rf", 
+                  metric = "Accuracy", 
+                  TuneGrid = grid, 
+                  trControl=control)
+end_time <- Sys.time()
+end_time - start_time
+
+library(randomForest)
+print(rf_model$finalModel)
+plot(rf_model$finalModel)
+varImpPlot(rf_model$finalModel)
+
+#Predict on Training set
+rf_train_pred <- predict(rf_model, train)
+confusionMatrix(train$isFraud, rf_train_pred, positive = "Yes")
+
+#Predict on Test set
+rf_test_pred <- predict(rf_model, test)
+confusionMatrix(test$isFraud, rf_test_pred, positive = "Yes")
+
+#Predict on Big No-Fraud dataset
+start_time <- Sys.time()
+rf_big_no_pred <- predict(rf_model, big_no_sample)
+end_time <- Sys.time()
+end_time - start_time
+
+confusionMatrix(big_no_sample$isFraud, rf_big_no_pred, positive = "Yes")
+
+
+#Plot the ROC curve against test data
+Plot the ROC curve
+rf_probs <- predict(rf_model, test, type = "prob")
+rf_ROC <- roc(response = test$isFraud, 
+                 predictor = rf_probs$Yes, 
+                 levels = levels(test$isFraud))
+
+plot(rf_ROC, col = "green")
+
+Area under the curve
+auc(rf_ROC)
